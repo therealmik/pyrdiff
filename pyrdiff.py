@@ -92,15 +92,17 @@ def generate_signatures(fobj, blocksize=DEFAULT_BLOCKSIZE):
 		yield Signature(faster_rollsum(buf), md4(buf), offset)
 		offset += blocksize
 
-def _find_delta(matches, md):
-	for (origmd, origoffset) in matches:
-		if origmd == md:
-			return origoffset
-
-def generate_delta(fobj, sigs, blocksize=DEFAULT_BLOCKSIZE):
+def generate_delta(fobj, signatures, blocksize=DEFAULT_BLOCKSIZE):
 	"""Given a file object and signatures from another file,
 	   generate a set of deltas (RawDataChange / FileOffsetChange)"""
 	buf = fobj.read() # Just read the whole damn file into memory
+
+	sigs = {}
+	for s in signatures:
+		if s.rollsum in sigs:
+			sigs[s.rollsum][s.md4sum] = s.offset
+		else:
+			sigs[s.rollsum] = { s.md4sum: s.offset }
 
 	rs = RollSum()
 	if len(buf) > blocksize:
@@ -111,31 +113,32 @@ def generate_delta(fobj, sigs, blocksize=DEFAULT_BLOCKSIZE):
 	offset = 0
 	while offset+blocksize < len(buf):
 		# Plow through the data, byte at a time
-		if rs.sum() in sigs:
+		try:
+			md4_table = sigs[rs.sum()]
 			md = md4(buf[offset:offset+blocksize])
-			file_offset = _find_delta(sigs, md)
-			if file_offset is not None:
-				if offset > 0:
-					yield RawDataChange(buf[:offset])
-				yield FileOffsetChange(file_offset)
-				buf = buf[offset+blocksize:]
-				offset = 0
-				continue
-		offset += 1
-		rs.rotate(buf[offset+blocksize], buf[offset-1])
+			file_offset = md4_table[md]
+			if offset > 0:
+				yield RawDataChange(buf[:offset])
+			yield FileOffsetChange(file_offset)
+			buf = buf[offset+blocksize:]
+			offset = 0
+		except KeyError:
+			offset += 1
+			rs.rotate(buf[offset+blocksize], buf[offset-1])
 
 	while offset < len(buf):
 		# See if the last block is still at the end of file
-		if rs.sum() in sigs:
+		try:
+			md4_table = sigs[rs.sum()]
 			md = md4(buf[offset:])
-			file_offset = _find_delta(sigs, md)
-			if file_offset is not None:
-				if offset > 0:
-					yield RawDataChange(buf[:offset])
-				yield FileOffsetChange(file_offset)
-				return
-		rs.rollout(buf[offset])
-		offset += 1
+			file_offset = md4_table[md]
+			if offset > 0:
+				yield RawDataChange(buf[:offset])
+			yield FileOffsetChange(file_offset)
+			return
+		except KeyError:
+			rs.rollout(buf[offset])
+			offset += 1
 
 	# Eh, have the data then
 	yield RawDataChange(buf)
