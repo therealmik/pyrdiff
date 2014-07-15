@@ -43,7 +43,7 @@ def faster_rollsum(data):
 def md4(data):
 	ctx = hashlib.new('md4')
 	ctx.update(data)
-	return ctx.digest()
+	return ctx.digest()[:8] # lol
 
 
 #########################
