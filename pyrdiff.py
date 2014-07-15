@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 
 import hashlib
+import math
 
 DEFAULT_BLOCKSIZE=2048
 DEFAULT_MD4_TRUNCATION=8 # lol
@@ -128,11 +129,30 @@ def read_delta_file(fd):
 		else:
 			raise ValueError("Invalid command: " + hex(command))
 
+def write_delta_file(fd, changes):
+	write_int(fd, RS_DELTA_MAGIC, 4)
+	for change in changes:
+		fd.write(change.serialize())
+	write_int(fd, 0, 1) # End
+
 class Signature(object):
 	def __init__(self, rollsum, md4sum, offset):
 		self.rollsum = rollsum
 		self.md4sum = md4sum
 		self.offset = offset
+
+def byte_length(i):
+	bit_len = i.bit_length()
+	if bit_len <= 8:
+		return 1
+	elif bit_len <= 16:
+		return 2
+	elif bit_len <= 32:
+		return 4
+	elif bit_len <= 64:
+		return 8
+	else:
+		raise ValueError("Cannot represent integers > 64bits")
 
 class CopyChange(object):
 	def __init__(self, offset, length):
@@ -145,12 +165,30 @@ class CopyChange(object):
 		assert(len(ret) == self.length)
 		return ret
 
+	def serialize(self):
+		offset_len = byte_length(self.offset)
+		length_len = byte_length(self.length)
+		command = 0x45 +
+			( int(math.log(offset_len, 2)) * 4 ) +
+			int(math.log(length_len, 2))
+		return command.to_bytes(1, 'big') +
+			self.offset.to_bytes(offset_length, 'big') +
+			self.length.to_bytes(length_length, 'big')
+
 class LiteralChange(object):
 	def __init__(self, data):
 		self.data = data
 
 	def compose(self, _fd):
 		return self.data
+
+	def serialize(self):
+		literal_len = len(self.data)
+		literal_len_length = byte_length(literal_len)
+		command = 0x41 + int(log(literal_len_length, 2))
+		return command.to_bytes(1, 'big') +
+			literal_len.to_bytes(literal_len_length, 'big') +
+			self.data
 
 
 #################
