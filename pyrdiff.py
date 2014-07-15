@@ -2,7 +2,7 @@
 
 import hashlib
 import math
-
+import binascii
 import sys
 import os
 
@@ -147,6 +147,9 @@ class Signature(object):
 		self.md4sum = md4sum
 		self.offset = offset
 
+	def __str__(self):
+		return "SIGNATURE: {0:08x} {1!r} {2!r}".format(self.rollsum, binascii.hexlify(self.md4sum), self.offset)
+
 def byte_length(i):
 	bit_len = i.bit_length()
 	if bit_len <= 8:
@@ -179,6 +182,11 @@ class CopyChange(object):
 
 	def __str__(self):
 		return "COPY {0:d} {1:d}".format(self.offset, self.length)
+
+	def __iadd__(self, other):
+		assert(other.offset == self.offset + self.length)
+		self.length += other.length
+		return self
 
 class LiteralChange(object):
 	def __init__(self, data):
@@ -220,18 +228,21 @@ def generate_delta(fobj, signatures, blocksize=DEFAULT_BLOCKSIZE, strong_sum_len
 	sigs = {}
 	for s in signatures:
 		if s.rollsum in sigs:
-			sigs[s.rollsum][s.md4sum] = s.offset
+			if s.md4sum not in sigs[s.rollsum]: # for identical/collision blocks, use only the first, as rdiff does
+				sigs[s.rollsum][s.md4sum] = s.offset
 		else:
 			sigs[s.rollsum] = { s.md4sum: s.offset }
 
 	rs = RollSum()
-	if len(buf) > blocksize:
-		# Prime the rolling checksum
-		for i in range(blocksize):
-			rs.rollin(buf[i])
 
 	offset = 0
 	while offset+blocksize < len(buf):
+		# Prime the rolling sum
+		if rs.count == 0:
+			for i in range(min(blocksize, len(buf))):
+				rs.rollin(buf[i])
+			continue
+
 		# Plow through the data, byte at a time
 		try:
 			md4_table = sigs[rs.sum()]
@@ -242,6 +253,7 @@ def generate_delta(fobj, signatures, blocksize=DEFAULT_BLOCKSIZE, strong_sum_len
 			yield CopyChange(file_offset, blocksize)
 			buf = buf[offset+blocksize:]
 			offset = 0
+			rs = RollSum()
 		except KeyError:
 			rs.rotate(buf[offset+blocksize], buf[offset])
 			offset += 1
@@ -262,6 +274,29 @@ def generate_delta(fobj, signatures, blocksize=DEFAULT_BLOCKSIZE, strong_sum_len
 
 	# Eh, have the data then
 	yield LiteralChange(buf)
+
+def merge_delta(generator):
+	prevcopy = None
+	for change in generator:
+		# Merge if we can
+		if isinstance(prevcopy, CopyChange):
+			if isinstance(change, CopyChange):
+				prevcopy += change
+				continue
+		# Ok, we don't need the held COPY
+		if prevcopy is not None:
+			yield prevcopy
+			prevcopy = None
+
+		# Hold on if we have a COPY
+		if isinstance(change, CopyChange):
+			prevcopy = change
+		else:
+			yield change
+
+	# If the last command was a copy, yield it before StopIteration
+	if prevcopy is not None:
+		yield prevcopy
 
 def patch(origfd, delta, outfd):
 	"""Given the original file (seekable FD) and the delta, write resulting file to outfd"""
@@ -307,13 +342,22 @@ def main():
 		newfilefd = readfilearg(3)
 		deltafd = writefilearg(4)
 		signatures = SignatureFileReader.open(sigfd)
-		delta = generate_delta(newfilefd, iter(signatures), signatures.block_len, signatures.strong_sum_len)
+		delta = merge_delta(generate_delta(newfilefd, iter(signatures), signatures.block_len, signatures.strong_sum_len))
 		write_delta_file(deltafd, delta)
 	elif sys.argv[1] == "patch":
 		basisfd = readfilearg(2, False)
 		delta = read_delta_file(readfilearg(3))
 		newfilefd = writefilearg(4)
 		patch(basisfd, delta, newfilefd)
+	elif sys.argv[1] == "debugdelta":
+		delta = read_delta_file(readfilearg(2))
+		for d in delta:
+			print(str(d))
+	elif sys.argv[1] == "debugsigs":
+		signatures = SignatureFileReader.open(readfilearg(2))
+		print("SIG HEADER: block_len={0:d} strong_sum_len={1:d}".format(signatures.block_len, signatures.strong_sum_len))
+		for s in iter(signatures):
+			print(str(s))
 	else:
 		usage()
 
