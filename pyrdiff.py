@@ -106,6 +106,28 @@ def write_signature_file(fd, block_len, strong_sum_len, signatures):
 		write_int(fd, signature.rollsum, 4)
 		write_int(fd, signature.md4sum[:strong_sum_len], self.strong_sum_len)
 
+def read_delta_file(fd):
+	if read_int(fd, 4) != RS_DELTA_MAGIC:
+		raise IOError("Invalid delta file magic")
+
+	while True:
+		command = read_int(fd, 1)
+		if command == 0: # RS_OP_END
+			return
+		elif command >= 0x41 and command <= 0x44:
+			literal_len_len = 1 << (command - 0x41)
+			literal_len = read_int(fd, literal_len_len)
+			yield LiteralChange(read_bytes(fd, literal_len))
+		elif command >= 0x45 and command <= 0x54:
+			command -= 0x45
+			offset_len = command // 4
+			length_len = command % 4
+			offset = read_int(where_len)
+			length = read_int(len_len)
+			yield CopyChange(offset, length)
+		else:
+			raise ValueError("Invalid command: " + hex(command))
+
 class Signature(object):
 	def __init__(self, rollsum, md4sum, offset):
 		self.rollsum = rollsum
