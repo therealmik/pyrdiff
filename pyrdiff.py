@@ -3,6 +3,9 @@
 import hashlib
 
 DEFAULT_BLOCKSIZE=2048
+DEFAULT_MD4_TRUNCATION=8 # lol
+RS_DELTA_MAGIC=0x72730236
+RS_SIG_MAGIC=0x72730136
 
 ##############################
 #### Checksums and Hashes ####
@@ -43,13 +46,65 @@ def faster_rollsum(data):
 def md4(data):
 	ctx = hashlib.new('md4')
 	ctx.update(data)
-	return ctx.digest()[:8] # lol
+	return ctx.digest()
 
 
 #########################
 #### Network Packets ####
 #########################
 
+def write_int(fd, i, nbytes):
+	buf = i.to_bytes(nbytes, 'big')
+	fd.write(buf)
+
+def read_bytes(fd, nbytes):
+	buf = fd.read(nbytes)
+	if len(buf) == 0:
+		raise EOFError()
+	if len(buf) != nbytes:
+		raise IOError("Unexpected EOF")
+	return buf
+
+def read_int(fd, nbytes):
+	buf = read_bytes(fd, nbytes)
+	return int.from_bytes(buf, 'big')
+
+class SignatureFileReader(object):
+	def __init__(self, block_len, strong_sum_len):
+		self.block_len = block_len
+		self.strong_sum_len = strong_sum_len
+
+	@classmethod
+	def open(cls, fd):
+		if read_int(fd, 4) != RS_SIG_MAGIC:
+			raise IOError("Invalid signature file magic")
+		block_len = read_int(fd, 4)
+		strong_sum_len = read_int(fd, 4)
+		if strong_sum_len <= 16 or strong_sum_len < 1:
+			raise ValueError("Strong sum length must be 1-16 bytes long")
+		self = cls(block_len, strong_sum_len)
+		self.readfd = fd
+		return self
+
+	def __iter__(self):
+		try:
+			offset = 0
+			while True:
+				rollsum = read_int(self.readfd, 4)
+				strong_sum = read_bytes(self.readfd, self.strong_sum_len)
+				yield Signature(rollsum, strong_sum, offset)
+				offset += self.block_len
+		except EOFError:
+			pass
+
+def write_signature_file(fd, block_len, strong_sum_len, signatures):
+	write_int(fd, self.RS_SIG_MAGIC, 4)
+	write_int(fd, self.block_len, 4)
+	write_int(fd, self.strong_sum_len, 4)
+
+	for signature in signatures:
+		write_int(fd, signature.rollsum, 4)
+		write_int(fd, signature.md4sum[:strong_sum_len], self.strong_sum_len)
 
 class Signature(object):
 	def __init__(self, rollsum, md4sum, offset):
@@ -92,7 +147,7 @@ def generate_signatures(fobj, blocksize=DEFAULT_BLOCKSIZE):
 		yield Signature(faster_rollsum(buf), md4(buf), offset)
 		offset += blocksize
 
-def generate_delta(fobj, signatures, blocksize=DEFAULT_BLOCKSIZE):
+def generate_delta(fobj, signatures, blocksize=DEFAULT_BLOCKSIZE, strong_sum_len = 16):
 	"""Given a file object and signatures from another file,
 	   generate a set of deltas (LiteralChange / CopyChange)"""
 	buf = fobj.read() # Just read the whole damn file into memory
@@ -115,7 +170,7 @@ def generate_delta(fobj, signatures, blocksize=DEFAULT_BLOCKSIZE):
 		# Plow through the data, byte at a time
 		try:
 			md4_table = sigs[rs.sum()]
-			md = md4(buf[offset:offset+blocksize])
+			md = md4(buf[offset:offset+blocksize])[:strong_sum_len]
 			file_offset = md4_table[md]
 			if offset > 0:
 				yield LiteralChange(buf[:offset])
@@ -130,7 +185,7 @@ def generate_delta(fobj, signatures, blocksize=DEFAULT_BLOCKSIZE):
 		# See if the last block is still at the end of file
 		try:
 			md4_table = sigs[rs.sum()]
-			md = md4(buf[offset:])
+			md = md4(buf[offset:])[:strong_sum_len]
 			file_offset = md4_table[md]
 			if offset > 0:
 				yield LiteralChange(buf[:offset])
