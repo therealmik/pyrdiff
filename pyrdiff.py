@@ -3,10 +3,16 @@
 import hashlib
 import math
 
+import sys
+import os
+
 DEFAULT_BLOCKSIZE=2048
 DEFAULT_MD4_TRUNCATION=8 # lol
 RS_DELTA_MAGIC=0x72730236
 RS_SIG_MAGIC=0x72730136
+
+def log2(i):
+	return int(math.log(i, 2))
 
 ##############################
 #### Checksums and Hashes ####
@@ -81,7 +87,7 @@ class SignatureFileReader(object):
 			raise IOError("Invalid signature file magic")
 		block_len = read_int(fd, 4)
 		strong_sum_len = read_int(fd, 4)
-		if strong_sum_len <= 16 or strong_sum_len < 1:
+		if strong_sum_len > 16 or strong_sum_len < 1:
 			raise ValueError("Strong sum length must be 1-16 bytes long")
 		self = cls(block_len, strong_sum_len)
 		self.readfd = fd
@@ -99,13 +105,13 @@ class SignatureFileReader(object):
 			pass
 
 def write_signature_file(fd, block_len, strong_sum_len, signatures):
-	write_int(fd, self.RS_SIG_MAGIC, 4)
-	write_int(fd, self.block_len, 4)
-	write_int(fd, self.strong_sum_len, 4)
+	write_int(fd, RS_SIG_MAGIC, 4)
+	write_int(fd, block_len, 4)
+	write_int(fd, strong_sum_len, 4)
 
 	for signature in signatures:
 		write_int(fd, signature.rollsum, 4)
-		write_int(fd, signature.md4sum[:strong_sum_len], self.strong_sum_len)
+		fd.write(signature.md4sum[:strong_sum_len])
 
 def read_delta_file(fd):
 	if read_int(fd, 4) != RS_DELTA_MAGIC:
@@ -121,10 +127,10 @@ def read_delta_file(fd):
 			yield LiteralChange(read_bytes(fd, literal_len))
 		elif command >= 0x45 and command <= 0x54:
 			command -= 0x45
-			offset_len = command // 4
-			length_len = command % 4
-			offset = read_int(where_len)
-			length = read_int(len_len)
+			offset_len = 1 << (command // 4)
+			length_len = 1 << (command % 4)
+			offset = read_int(fd, offset_len)
+			length = read_int(fd, length_len)
 			yield CopyChange(offset, length)
 		else:
 			raise ValueError("Invalid command: " + hex(command))
@@ -168,12 +174,11 @@ class CopyChange(object):
 	def serialize(self):
 		offset_len = byte_length(self.offset)
 		length_len = byte_length(self.length)
-		command = 0x45 +
-			( int(math.log(offset_len, 2)) * 4 ) +
-			int(math.log(length_len, 2))
-		return command.to_bytes(1, 'big') +
-			self.offset.to_bytes(offset_length, 'big') +
-			self.length.to_bytes(length_length, 'big')
+		command = 0x45 + ( log2(offset_len) * 4 ) + log2(length_len)
+		return command.to_bytes(1, 'big') + self.offset.to_bytes(offset_len, 'big') + self.length.to_bytes(length_len, 'big')
+
+	def __str__(self):
+		return "COPY {0:d} {1:d}".format(self.offset, self.length)
 
 class LiteralChange(object):
 	def __init__(self, data):
@@ -185,11 +190,11 @@ class LiteralChange(object):
 	def serialize(self):
 		literal_len = len(self.data)
 		literal_len_length = byte_length(literal_len)
-		command = 0x41 + int(log(literal_len_length, 2))
-		return command.to_bytes(1, 'big') +
-			literal_len.to_bytes(literal_len_length, 'big') +
-			self.data
+		command = 0x41 + log2(literal_len_length)
+		return command.to_bytes(1, 'big') + literal_len.to_bytes(literal_len_length, 'big') + self.data
 
+	def __str__(self):
+		return "LITERAL [{0:d} bytes]".format(len(self.data))
 
 #################
 #### Actions ####
@@ -258,25 +263,59 @@ def generate_delta(fobj, signatures, blocksize=DEFAULT_BLOCKSIZE, strong_sum_len
 	# Eh, have the data then
 	yield LiteralChange(buf)
 
-def apply_delta(origfd, delta, outfd):
+def patch(origfd, delta, outfd):
 	"""Given the original file (seekable FD) and the delta, write resulting file to outfd"""
 	for change in delta:
 		outfd.write(change.compose(origfd))
 
+def usage():
+	print("Usage: {0:s} <command> [options ...]".format(sys.argv[0]), file=sys.stderr)
+	print("     signature [BASIS [SIGNATURE]]", file=sys.stderr)
+	print("     delta SIGNATURE [NEWFILE [DELTA]]", file=sys.stderr)
+	print("     patch BASIS [DELTA [NEWFILE]]", file=sys.stderr)
+	print(" (optional args replaced with stdin/stdout as appropriate", file=sys.stderr)
+	sys.exit(1)
+
+def readfilearg(i, use_stdin=True):
+	if len(sys.argv) <= i:
+		if use_stdin:
+			return os.fdopen(0, "rb")
+		else:
+			usage()
+	else:
+		return open(sys.argv[i], "rb")
+
+def writefilearg(i, use_stdout=True):
+	if len(sys.argv) <= i:
+		if use_stdout:
+			return os.fdopen(1, "wb")
+		else:
+			usage()
+	else:
+		return open(sys.argv[i], "wb")
+
 def main():
-	import sys
-	import os
-
-	if len(sys.argv) != 4:
-		print("Usage: {0:s} <origfile> <changedfile> <syncedfile>".format(sys.argv[0]), file=sys.stderr)
-		sys.exit(1)
-	if os.path.exists(sys.argv[3]):
-		print("Error: syncedfile already exists", file=sys.stderr)
-		sys.exit(1)
-	sigs = generate_signatures(open(sys.argv[1], "rb"))
-	delta = generate_delta(open(sys.argv[2], "rb"), sigs)
-	apply_delta(open(sys.argv[1], "rb"), delta, open(sys.argv[3], "wb"))
-
+	if len(sys.argv) < 2:
+		usage()
+	if sys.argv[1] == "signature":
+		basisfd = readfilearg(2)
+		sigfd = writefilearg(3)
+		signatures = generate_signatures(basisfd, DEFAULT_BLOCKSIZE)
+		write_signature_file(sigfd, DEFAULT_BLOCKSIZE, DEFAULT_MD4_TRUNCATION, signatures)
+	elif sys.argv[1] == "delta":
+		sigfd = readfilearg(2, False)
+		newfilefd = readfilearg(3)
+		deltafd = writefilearg(4)
+		signatures = SignatureFileReader.open(sigfd)
+		delta = generate_delta(newfilefd, iter(signatures), signatures.block_len, signatures.strong_sum_len)
+		write_delta_file(deltafd, delta)
+	elif sys.argv[1] == "patch":
+		basisfd = readfilearg(2, False)
+		delta = read_delta_file(readfilearg(3))
+		newfilefd = writefilearg(4)
+		patch(basisfd, delta, newfilefd)
+	else:
+		usage()
 
 if __name__ == "__main__":
 	main()
