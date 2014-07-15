@@ -17,7 +17,7 @@ class RollSum(object):
 	
 	def rotate(self, inch, outch):
 		self.A = (self.A + inch - outch) % 65536
-		self.B = (self.B + self.A - (count * (outch + 31))) % 65536
+		self.B = (self.B + self.A - (self.count * (outch + 31))) % 65536
 
 	def rollin(self, inch):
 		self.A = (self.A + inch + 31) % 65536
@@ -87,14 +87,14 @@ def generate_signatures(fobj, blocksize=DEFAULT_BLOCKSIZE):
 
 	while True:
 		buf = fobj.read(blocksize) # Assuming blocking mode
-		if buf == '':
+		if len(buf) == 0:
 			return
 		yield Signature(faster_rollsum(buf), md4(buf), offset)
 		offset += blocksize
 
 def generate_delta(fobj, signatures, blocksize=DEFAULT_BLOCKSIZE):
 	"""Given a file object and signatures from another file,
-	   generate a set of deltas (RawDataChange / FileOffsetChange)"""
+	   generate a set of deltas (LiteralChange / CopyChange)"""
 	buf = fobj.read() # Just read the whole damn file into memory
 
 	sigs = {}
@@ -118,13 +118,13 @@ def generate_delta(fobj, signatures, blocksize=DEFAULT_BLOCKSIZE):
 			md = md4(buf[offset:offset+blocksize])
 			file_offset = md4_table[md]
 			if offset > 0:
-				yield RawDataChange(buf[:offset])
-			yield FileOffsetChange(file_offset)
+				yield LiteralChange(buf[:offset])
+			yield CopyChange(file_offset, blocksize)
 			buf = buf[offset+blocksize:]
 			offset = 0
 		except KeyError:
+			rs.rotate(buf[offset+blocksize], buf[offset])
 			offset += 1
-			rs.rotate(buf[offset+blocksize], buf[offset-1])
 
 	while offset < len(buf):
 		# See if the last block is still at the end of file
@@ -133,18 +133,35 @@ def generate_delta(fobj, signatures, blocksize=DEFAULT_BLOCKSIZE):
 			md = md4(buf[offset:])
 			file_offset = md4_table[md]
 			if offset > 0:
-				yield RawDataChange(buf[:offset])
-			yield FileOffsetChange(file_offset)
+				yield LiteralChange(buf[:offset])
+			yield CopyChange(file_offset, blocksize)
 			return
 		except KeyError:
 			rs.rollout(buf[offset])
 			offset += 1
 
 	# Eh, have the data then
-	yield RawDataChange(buf)
+	yield LiteralChange(buf)
 
-def apply_delta(origfd, delta, outfd, blocksize=DEFAULT_BLOCKSIZE):
+def apply_delta(origfd, delta, outfd):
 	"""Given the original file (seekable FD) and the delta, write resulting file to outfd"""
 	for change in delta:
-		outfd.write(change.compose(origfd, blocksize))
+		outfd.write(change.compose(origfd))
 
+def main():
+	import sys
+	import os
+
+	if len(sys.argv) != 4:
+		print("Usage: {0:s} <origfile> <changedfile> <syncedfile>".format(sys.argv[0]), file=sys.stderr)
+		sys.exit(1)
+	if os.path.exists(sys.argv[3]):
+		print("Error: syncedfile already exists", file=sys.stderr)
+		sys.exit(1)
+	sigs = generate_signatures(open(sys.argv[1], "rb"))
+	delta = generate_delta(open(sys.argv[2], "rb"), sigs)
+	apply_delta(open(sys.argv[1], "rb"), delta, open(sys.argv[3], "wb"))
+
+
+if __name__ == "__main__":
+	main()
