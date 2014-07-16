@@ -24,6 +24,11 @@ class RollSum(object):
 		self.count = 0
 		self.A = 0
 		self.B = 0
+
+	def set(self, value, count):
+		self.A = value & 0xffff
+		self.B = (value >> 16) & 0xffff
+		self.count = count
 	
 	def rotate(self, inch, outch):
 		self.A = (self.A + inch - outch) % 65536
@@ -56,90 +61,9 @@ def md4(data):
 	return ctx.digest()
 
 
-#########################
-#### Network Packets ####
-#########################
-
-def write_int(fd, i, nbytes):
-	buf = i.to_bytes(nbytes, 'big')
-	fd.write(buf)
-
-def read_bytes(fd, nbytes):
-	buf = fd.read(nbytes)
-	if len(buf) == 0:
-		raise EOFError()
-	if len(buf) != nbytes:
-		raise IOError("Unexpected EOF")
-	return buf
-
-def read_int(fd, nbytes):
-	buf = read_bytes(fd, nbytes)
-	return int.from_bytes(buf, 'big')
-
-class SignatureFileReader(object):
-	def __init__(self, block_len, strong_sum_len):
-		self.block_len = block_len
-		self.strong_sum_len = strong_sum_len
-
-	@classmethod
-	def open(cls, fd):
-		if read_int(fd, 4) != RS_SIG_MAGIC:
-			raise IOError("Invalid signature file magic")
-		block_len = read_int(fd, 4)
-		strong_sum_len = read_int(fd, 4)
-		if strong_sum_len > 16 or strong_sum_len < 1:
-			raise ValueError("Strong sum length must be 1-16 bytes long")
-		self = cls(block_len, strong_sum_len)
-		self.readfd = fd
-		return self
-
-	def __iter__(self):
-		try:
-			offset = 0
-			while True:
-				rollsum = read_int(self.readfd, 4)
-				strong_sum = read_bytes(self.readfd, self.strong_sum_len)
-				yield Signature(rollsum, strong_sum, offset)
-				offset += self.block_len
-		except EOFError:
-			pass
-
-def write_signature_file(fd, block_len, strong_sum_len, signatures):
-	write_int(fd, RS_SIG_MAGIC, 4)
-	write_int(fd, block_len, 4)
-	write_int(fd, strong_sum_len, 4)
-
-	for signature in signatures:
-		write_int(fd, signature.rollsum, 4)
-		fd.write(signature.md4sum[:strong_sum_len])
-
-def read_delta_file(fd):
-	if read_int(fd, 4) != RS_DELTA_MAGIC:
-		raise IOError("Invalid delta file magic")
-
-	while True:
-		command = read_int(fd, 1)
-		if command == 0: # RS_OP_END
-			return
-		elif command >= 0x41 and command <= 0x44:
-			literal_len_len = 1 << (command - 0x41)
-			literal_len = read_int(fd, literal_len_len)
-			yield LiteralChange(read_bytes(fd, literal_len))
-		elif command >= 0x45 and command <= 0x54:
-			command -= 0x45
-			offset_len = 1 << (command // 4)
-			length_len = 1 << (command % 4)
-			offset = read_int(fd, offset_len)
-			length = read_int(fd, length_len)
-			yield CopyChange(offset, length)
-		else:
-			raise ValueError("Invalid command: " + hex(command))
-
-def write_delta_file(fd, changes):
-	write_int(fd, RS_DELTA_MAGIC, 4)
-	for change in changes:
-		fd.write(change.serialize())
-	write_int(fd, 0, 1) # End
+#################
+#### Packets ####
+#################
 
 class Signature(object):
 	def __init__(self, rollsum, md4sum, offset):
@@ -184,7 +108,10 @@ class CopyChange(object):
 		return "COPY {0:d} {1:d}".format(self.offset, self.length)
 
 	def __iadd__(self, other):
-		assert(other.offset == self.offset + self.length)
+		# NOTE: "real" rdiff wouldn't merge COPY changes for repeated blocks, because
+		# they'd all point to the same offset, rather than contiuous offsets.
+		# That makes for bigger delta files for large runs of the same block (eg. a sparse file)
+		# Compare debugdelta output for real rdiff vs this tool on dd if=/dev/zero .... to see
 		self.length += other.length
 		return self
 
@@ -204,104 +131,214 @@ class LiteralChange(object):
 	def __str__(self):
 		return "LITERAL [{0:d} bytes]".format(len(self.data))
 
-#################
-#### Actions ####
-#################
+	def __iadd__(self, other):
+		self.data += other.data
+
+######################
+#### File formats ####
+######################
+
+def write_int(fd, i, nbytes):
+	buf = i.to_bytes(nbytes, 'big')
+	fd.write(buf)
+
+def read_bytes(fd, nbytes):
+	buf = fd.read(nbytes)
+	if len(buf) == 0:
+		raise EOFError()
+	if len(buf) != nbytes:
+		raise IOError("Unexpected EOF")
+	return buf
+
+def read_int(fd, nbytes):
+	buf = read_bytes(fd, nbytes)
+	return int.from_bytes(buf, 'big')
+
+class Signatures(object):
+	def __init__(self, blocksize, md4_truncation):
+		self.blocksize = blocksize
+		self.md4_truncation = md4_truncation
+
+	def __iter__(self):
+		return self.iterator
+
+	@classmethod
+	def from_signature_file(cls, fd):
+		if read_int(fd, 4) != RS_SIG_MAGIC:
+			raise IOError("Invalid signature file magic")
+		blocksize = read_int(fd, 4)
+		md4_truncation = read_int(fd, 4)
+		if md4_truncation > 16 or md4_truncation < 1:
+			raise ValueError("Strong sum length must be 1-16 bytes long")
+		self = cls(blocksize, md4_truncation)
+		self.iterator = self._generate_from_signature_file(fd)
+		return self
+
+	@classmethod
+	def from_basis_file(cls, fd, blocksize=DEFAULT_BLOCKSIZE, md4_truncation=DEFAULT_MD4_TRUNCATION):
+		self = cls(blocksize, md4_truncation)
+		self.iterator = self._generate_from_basis(fd)
+		return self
+
+	def write(self, fd):
+		write_int(fd, RS_SIG_MAGIC, 4)
+		write_int(fd, self.blocksize, 4)
+		write_int(fd, self.md4_truncation, 4)
+		for signature in self.iterator:
+			write_int(fd, signature.rollsum, 4)
+			fd.write(signature.md4sum[:self.md4_truncation])
 
 
-def generate_signatures(fobj, blocksize=DEFAULT_BLOCKSIZE):
-	"""generate signatures for each block in fobj"""
-	offset = 0
-
-	while True:
-		buf = fobj.read(blocksize) # Assuming blocking mode
-		if len(buf) == 0:
-			return
-		yield Signature(faster_rollsum(buf), md4(buf), offset)
-		offset += blocksize
-
-def generate_delta(fobj, signatures, blocksize=DEFAULT_BLOCKSIZE, strong_sum_len = 16):
-	"""Given a file object and signatures from another file,
-	   generate a set of deltas (LiteralChange / CopyChange)"""
-	buf = fobj.read() # Just read the whole damn file into memory
-
-	sigs = {}
-	for s in signatures:
-		if s.rollsum in sigs:
-			if s.md4sum not in sigs[s.rollsum]: # for identical/collision blocks, use only the first, as rdiff does
-				sigs[s.rollsum][s.md4sum] = s.offset
-		else:
-			sigs[s.rollsum] = { s.md4sum: s.offset }
-
-	rs = RollSum()
-
-	offset = 0
-	while offset+blocksize < len(buf):
-		# Prime the rolling sum
-		if rs.count == 0:
-			for i in range(min(blocksize, len(buf))):
-				rs.rollin(buf[i])
-			continue
-
-		# Plow through the data, byte at a time
+	def _generate_from_signature_file(self, fd):
 		try:
-			md4_table = sigs[rs.sum()]
-			md = md4(buf[offset:offset+blocksize])[:strong_sum_len]
-			file_offset = md4_table[md]
-			if offset > 0:
-				yield LiteralChange(buf[:offset])
-			yield CopyChange(file_offset, blocksize)
-			buf = buf[offset+blocksize:]
 			offset = 0
-			rs = RollSum()
-		except KeyError:
-			rs.rotate(buf[offset+blocksize], buf[offset])
-			offset += 1
+			while True:
+				rollsum = read_int(fd, 4)
+				strong_sum = read_bytes(fd, self.md4_truncation)
+				yield Signature(rollsum, strong_sum, offset)
+				offset += self.blocksize
+		except EOFError:
+			pass
 
-	while offset < len(buf):
-		# See if the last block is still at the end of file
-		try:
-			md4_table = sigs[rs.sum()]
-			md = md4(buf[offset:])[:strong_sum_len]
-			file_offset = md4_table[md]
-			if offset > 0:
-				yield LiteralChange(buf[:offset])
-			yield CopyChange(file_offset, blocksize)
-			return
-		except KeyError:
-			rs.rollout(buf[offset])
-			offset += 1
+	def _generate_from_basis(self, fobj):
+		"""generate signatures for each block in fobj"""
+		offset = 0
 
-	# Eh, have the data then
-	yield LiteralChange(buf)
+		while True:
+			buf = fobj.read(self.blocksize) # Assuming blocking mode
+			if len(buf) == 0:
+				return
+			yield Signature(faster_rollsum(buf), md4(buf)[:self.md4_truncation], offset)
+			offset += self.blocksize
 
-def merge_delta(generator):
-	prevcopy = None
-	for change in generator:
-		# Merge if we can
-		if isinstance(prevcopy, CopyChange):
-			if isinstance(change, CopyChange):
-				prevcopy += change
+
+class Delta(object):
+	def __init__(self, iterator):
+		self.iterator = iterator
+
+	def __iter__(self):
+		return self.iterator
+
+	def patch(self, origfd, outfd):
+		"""Given the original file (seekable FD) and the delta, write resulting file to outfd"""
+		for change in iter(self):
+			outfd.write(change.compose(origfd))
+
+	def write(self, fd):
+		write_int(fd, RS_DELTA_MAGIC, 4)
+		for change in self.iterator:
+			fd.write(change.serialize())
+		write_int(fd, 0, 1) # End
+
+	@classmethod
+	def from_delta_file(cls, fd):
+		return cls(cls.read_delta_file(fd))
+	
+	@staticmethod
+	def read_delta_file(fd):
+		if read_int(fd, 4) != RS_DELTA_MAGIC:
+			raise IOError("Invalid delta file magic")
+
+		while True:
+			command = read_int(fd, 1)
+			if command == 0: # RS_OP_END
+				return
+			elif command >= 0x41 and command <= 0x44:
+				literal_len_len = 1 << (command - 0x41)
+				literal_len = read_int(fd, literal_len_len)
+				yield LiteralChange(read_bytes(fd, literal_len))
+			elif command >= 0x45 and command <= 0x54:
+				command -= 0x45
+				offset_len = 1 << (command // 4)
+				length_len = 1 << (command % 4)
+				offset = read_int(fd, offset_len)
+				length = read_int(fd, length_len)
+				yield CopyChange(offset, length)
+			else:
+				raise ValueError("Invalid command: " + hex(command))
+
+	@classmethod
+	def from_signatures(cls, signatures, changedfd):
+		return cls(cls._merge_delta(cls._generate_delta(signatures, changedfd)))
+
+	@staticmethod
+	def _generate_delta(signatures, changedfd):
+		"""Given a file object and signatures from another file,
+		   generate a set of deltas (LiteralChange / CopyChange)"""
+		buf = changedfd.read() # Just read the whole damn file into memory
+		blocksize = signatures.blocksize
+		md4_truncation = signatures.md4_truncation
+
+		sigs = {}
+		for s in iter(signatures):
+			if s.rollsum in sigs:
+				if s.md4sum not in sigs[s.rollsum]: # for identical/collision blocks, use only the first, as rdiff does
+					sigs[s.rollsum][s.md4sum] = s.offset
+			else:
+				sigs[s.rollsum] = { s.md4sum: s.offset }
+
+		rs = RollSum()
+
+		offset = 0
+		while offset+blocksize < len(buf):
+			# Prime the rolling sum
+			if rs.count == 0:
+				count = min(blocksize, len(buf))
+				rs.set(faster_rollsum(buf[:count]), count)
 				continue
-		# Ok, we don't need the held COPY
-		if prevcopy is not None:
-			yield prevcopy
-			prevcopy = None
 
-		# Hold on if we have a COPY
-		if isinstance(change, CopyChange):
-			prevcopy = change
-		else:
-			yield change
+			# Plow through the data, byte at a time
+			try:
+				md4_table = sigs[rs.sum()]
+				md = md4(buf[offset:offset+blocksize])[:md4_truncation]
+				file_offset = md4_table[md]
+				if offset > 0:
+					yield LiteralChange(buf[:offset])
+				yield CopyChange(file_offset, blocksize)
+				buf = buf[offset+blocksize:]
+				offset = 0
+				rs = RollSum()
+			except KeyError:
+				rs.rotate(buf[offset+blocksize], buf[offset])
+				offset += 1
 
-	# If the last command was a copy, yield it before StopIteration
-	if prevcopy is not None:
-		yield prevcopy
+		# Processing the last block is a bit different
+		while offset < len(buf):
+			# See if the last block is still at the end of file
+			try:
+				md4_table = sigs[rs.sum()]
+				md = md4(buf[offset:])[:md4_truncation]
+				file_offset = md4_table[md]
+				if offset > 0:
+					yield LiteralChange(buf[:offset])
+				yield CopyChange(file_offset, blocksize)
+				return
+			except KeyError:
+				rs.rollout(buf[offset])
+				offset += 1
 
-def patch(origfd, delta, outfd):
-	"""Given the original file (seekable FD) and the delta, write resulting file to outfd"""
-	for change in delta:
-		outfd.write(change.compose(origfd))
+		# Eh, have the data then
+		yield LiteralChange(buf)
+
+	@staticmethod
+	def _merge_delta(generator):
+		"""Merge adjacent COPY blocks"""
+		prevchange = None
+		for change in generator:
+			# Merge if we can
+			if prevchange.__class__ == change.__class__:
+				prevchange += change
+			else:
+				if prevchange != None:
+					yield prevchange
+				prevchange = change
+		# If the last command was a copy, yield it before StopIteration
+		if prevchange is not None:
+			yield prevchange
+
+########################
+#### High-level API ####
+########################
 
 def usage():
 	print("Usage: {0:s} <command> [options ...]".format(sys.argv[0]), file=sys.stderr)
@@ -335,27 +372,24 @@ def main():
 	if sys.argv[1] == "signature":
 		basisfd = readfilearg(2)
 		sigfd = writefilearg(3)
-		signatures = generate_signatures(basisfd, DEFAULT_BLOCKSIZE)
-		write_signature_file(sigfd, DEFAULT_BLOCKSIZE, DEFAULT_MD4_TRUNCATION, signatures)
+		Signatures.from_basis_file(basisfd).write(sigfd)
 	elif sys.argv[1] == "delta":
 		sigfd = readfilearg(2, False)
 		newfilefd = readfilearg(3)
 		deltafd = writefilearg(4)
-		signatures = SignatureFileReader.open(sigfd)
-		delta = merge_delta(generate_delta(newfilefd, iter(signatures), signatures.block_len, signatures.strong_sum_len))
-		write_delta_file(deltafd, delta)
+		signatures = Signatures.from_signature_file(sigfd)
+		Delta.from_signatures(signatures, newfilefd).write(deltafd)
 	elif sys.argv[1] == "patch":
 		basisfd = readfilearg(2, False)
-		delta = read_delta_file(readfilearg(3))
+		deltafd = readfilearg(3)
 		newfilefd = writefilearg(4)
-		patch(basisfd, delta, newfilefd)
+		Delta.from_delta_file(deltafd).patch(basisfd, newfilefd)
 	elif sys.argv[1] == "debugdelta":
-		delta = read_delta_file(readfilearg(2))
-		for d in delta:
+		for d in iter(Delta.from_delta_file(readfilearg(2))):
 			print(str(d))
 	elif sys.argv[1] == "debugsigs":
-		signatures = SignatureFileReader.open(readfilearg(2))
-		print("SIG HEADER: block_len={0:d} strong_sum_len={1:d}".format(signatures.block_len, signatures.strong_sum_len))
+		signatures = Signatures.from_signature_file(readfilearg(2))
+		print("SIG HEADER: blocksize={0:d} md4_truncation={1:d}".format(signatures.blocksize, signatures.md4_truncation))
 		for s in iter(signatures):
 			print(str(s))
 	else:
