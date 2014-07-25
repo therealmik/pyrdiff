@@ -1,10 +1,13 @@
-#!/usr/bin/python3
+#!/usr/bin/python
+
+from __future__ import print_function
 
 import hashlib
 import math
 import binascii
 import sys
 import os
+import struct
 
 DEFAULT_BLOCKSIZE=2048
 DEFAULT_MD4_TRUNCATION=8 # lol
@@ -50,7 +53,7 @@ class RollSum(object):
 def faster_rollsum(data):
 	A = 0
 	B = 0
-	for d in data:
+	for d in map(ord, data):
 		A += d + 31
 		B += A
 	return (A & 0xffff) | ((B & 0xffff) * 65536)
@@ -87,6 +90,16 @@ def byte_length(i):
 	else:
 		raise ValueError("Cannot represent integers > 64bits")
 
+_integer_encoders = {
+	1: chr,
+	2: struct.Struct(">H").pack,
+	4: struct.Struct(">L").pack,
+	8: struct.Struct(">Q").pack,
+}
+
+def encode_int(i, l):
+	return _integer_encoders[l](i)
+	
 class CopyChange(object):
 	def __init__(self, offset, length):
 		self.offset = offset
@@ -102,7 +115,7 @@ class CopyChange(object):
 		offset_len = byte_length(self.offset)
 		length_len = byte_length(self.length)
 		command = 0x45 + ( log2(offset_len) * 4 ) + log2(length_len)
-		return command.to_bytes(1, 'big') + self.offset.to_bytes(offset_len, 'big') + self.length.to_bytes(length_len, 'big')
+		return chr(command) + encode_int(self.offset, offset_len) + encode_int(self.length, length_len)
 
 	def __str__(self):
 		return "COPY {0:d} {1:d}".format(self.offset, self.length)
@@ -126,7 +139,7 @@ class LiteralChange(object):
 		literal_len = len(self.data)
 		literal_len_length = byte_length(literal_len)
 		command = 0x41 + log2(literal_len_length)
-		return command.to_bytes(1, 'big') + literal_len.to_bytes(literal_len_length, 'big') + self.data
+		return chr(command) + encode_int(literal_len, literal_len_length) + self.data
 
 	def __str__(self):
 		return "LITERAL [{0:d} bytes]".format(len(self.data))
@@ -139,7 +152,7 @@ class LiteralChange(object):
 ######################
 
 def write_int(fd, i, nbytes):
-	buf = i.to_bytes(nbytes, 'big')
+	buf = encode_int(i, nbytes)
 	fd.write(buf)
 
 def read_bytes(fd, nbytes):
@@ -150,9 +163,16 @@ def read_bytes(fd, nbytes):
 		raise IOError("Unexpected EOF")
 	return buf
 
+_integer_decoders = {
+	1: struct.Struct(">B").unpack,
+	2: struct.Struct(">H").unpack,
+	4: struct.Struct(">L").unpack,
+	8: struct.Struct(">Q").unpack,
+}
+
 def read_int(fd, nbytes):
 	buf = read_bytes(fd, nbytes)
-	return int.from_bytes(buf, 'big')
+	return _integer_decoders[nbytes](buf)[0]
 
 class Signatures(object):
 	def __init__(self, blocksize, md4_truncation):
@@ -299,7 +319,7 @@ class Delta(object):
 				offset = 0
 				rs = RollSum()
 			except KeyError:
-				rs.rotate(buf[offset+blocksize], buf[offset])
+				rs.rotate(ord(buf[offset+blocksize]), ord(buf[offset]))
 				offset += 1
 
 		# Processing the last block is a bit different
@@ -314,7 +334,7 @@ class Delta(object):
 				yield CopyChange(file_offset, blocksize)
 				return
 			except KeyError:
-				rs.rollout(buf[offset])
+				rs.rollout(ord(buf[offset]))
 				offset += 1
 
 		# Eh, have the data then
