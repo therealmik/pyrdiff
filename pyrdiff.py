@@ -120,6 +120,11 @@ class CopyChange(object):
 	def __str__(self):
 		return "COPY {0:d} {1:d}".format(self.offset, self.length)
 
+	def can_merge(self, other):
+		if self.__class__ != other.__class__:
+			return False
+		return (self.offset == other.offset or self.offset+self.length == other.offset)
+
 	def __iadd__(self, other):
 		# NOTE: "real" rdiff wouldn't merge COPY changes for repeated blocks, because
 		# they'd all point to the same offset, rather than contiuous offsets.
@@ -144,8 +149,24 @@ class LiteralChange(object):
 	def __str__(self):
 		return "LITERAL [{0:d} bytes]".format(len(self.data))
 
+	def can_merge(self, other):
+		return self.__class__ == other.__class__
+
 	def __iadd__(self, other):
 		self.data += other.data
+
+class NoChange(object):
+	def compose(self, _fd):
+		return ""
+
+	def serialize(self):
+		return ""
+
+	def __str__(self):
+		return ""
+
+	def can_merge(self, other):
+		return False
 
 ######################
 #### File formats ####
@@ -342,19 +363,16 @@ class Delta(object):
 
 	@staticmethod
 	def _merge_delta(generator):
-		"""Merge adjacent COPY blocks"""
-		prevchange = None
+		"""Merge adjacent changes of the same type, if possible"""
+		prevchange = NoChange()
 		for change in generator:
 			# Merge if we can
-			if prevchange.__class__ == change.__class__:
+			if prevchange.can_merge(change):
 				prevchange += change
 			else:
-				if prevchange != None:
-					yield prevchange
+				yield prevchange
 				prevchange = change
-		# If the last command was a copy, yield it before StopIteration
-		if prevchange is not None:
-			yield prevchange
+		yield prevchange
 
 ########################
 #### High-level API ####
