@@ -35,16 +35,20 @@ class RollSum(object):
 		self.B = (value >> 16) & 0xffff
 		self.count = count
 	
-	def rotate(self, inch, outch):
+	def rotate(self, instr, outstr):
+		inch = decode_int(instr)
+		outch = decode_int(outstr)
 		self.A = (self.A + inch - outch) % 65536
 		self.B = (self.B + self.A - (self.count * (outch + 31))) % 65536
 
-	def rollin(self, inch):
+	def rollin(self, instr):
+		inch = decode_int(instr)
 		self.A = (self.A + inch + 31) % 65536
 		self.B = (self.B + self.A) % 65536
 		self.count += 1
 
-	def rollout(self, outch):
+	def rollout(self, outstr):
+		outch = decode_int(outstr)
 		self.A = (self.A - outch) % 65536
 		self.B = (self.B - (self.count * (outch + 31))) % 65536
 		self.count -= 1
@@ -55,7 +59,7 @@ class RollSum(object):
 def faster_rollsum(data):
 	A = 0
 	B = 0
-	for d in map(ord, data):
+	for d in map(decode_int, data):
 		A += d + 31
 		B += A
 	return (A & 0xffff) | ((B & 0xffff) * 65536)
@@ -97,7 +101,7 @@ def byte_length(i):
 		raise ValueError("Cannot represent integers > 64bits")
 
 _integer_encoders = {
-	1: chr,
+	1: struct.Struct(">B").pack,
 	2: struct.Struct(">H").pack,
 	4: struct.Struct(">L").pack,
 	8: struct.Struct(">Q").pack,
@@ -105,6 +109,16 @@ _integer_encoders = {
 
 def encode_int(i, l):
 	return _integer_encoders[l](i)
+
+_integer_decoders = {
+	1: struct.Struct(">B").unpack,
+	2: struct.Struct(">H").unpack,
+	4: struct.Struct(">L").unpack,
+	8: struct.Struct(">Q").unpack,
+}
+
+def decode_int(i, l=1):
+	return _integer_decoders[l](i)[0]
 	
 class CopyChange(object):
 	def __init__(self, offset, length):
@@ -121,7 +135,7 @@ class CopyChange(object):
 		offset_len = byte_length(self.offset)
 		length_len = byte_length(self.length)
 		command = 0x45 + ( log2(offset_len) * 4 ) + log2(length_len)
-		return chr(command) + encode_int(self.offset, offset_len) + encode_int(self.length, length_len)
+		return encode_int(command, 1) + encode_int(self.offset, offset_len) + encode_int(self.length, length_len)
 
 	def __str__(self):
 		return "COPY {0:d} {1:d}".format(self.offset, self.length)
@@ -150,7 +164,7 @@ class LiteralChange(object):
 		literal_len = len(self.data)
 		literal_len_length = byte_length(literal_len)
 		command = 0x41 + log2(literal_len_length)
-		return chr(command) + encode_int(literal_len, literal_len_length) + self.data
+		return encode_int(command, 1) + encode_int(literal_len, literal_len_length) + self.data
 
 	def __str__(self):
 		return "LITERAL [{0:d} bytes]".format(len(self.data))
@@ -190,16 +204,9 @@ def read_bytes(fd, nbytes):
 		raise IOError("Unexpected EOF")
 	return buf
 
-_integer_decoders = {
-	1: struct.Struct(">B").unpack,
-	2: struct.Struct(">H").unpack,
-	4: struct.Struct(">L").unpack,
-	8: struct.Struct(">Q").unpack,
-}
-
 def read_int(fd, nbytes):
 	buf = read_bytes(fd, nbytes)
-	return _integer_decoders[nbytes](buf)[0]
+	return decode_int(buf, nbytes)
 
 class Signatures(object):
 	def __init__(self, blocksize, hash_truncation, magic=RS_BLAKE2_SIG_MAGIC):
@@ -360,7 +367,7 @@ class Delta(object):
 				offset = 0
 				rs = RollSum()
 			except KeyError:
-				rs.rotate(ord(buf[offset+blocksize]), ord(buf[offset]))
+				rs.rotate(buf[offset+blocksize], buf[offset])
 				offset += 1
 
 		# Processing the last block is a bit different
@@ -375,7 +382,7 @@ class Delta(object):
 				yield CopyChange(file_offset, blocksize)
 				return
 			except KeyError:
-				rs.rollout(ord(buf[offset]))
+				rs.rollout(buf[offset])
 				offset += 1
 
 		# Eh, have the data then
