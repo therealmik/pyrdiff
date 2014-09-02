@@ -8,11 +8,13 @@ import binascii
 import sys
 import os
 import struct
+import pyblake2 # pip install pyblake2
 
 DEFAULT_BLOCKSIZE=2048
-DEFAULT_MD4_TRUNCATION=8 # lol
+DEFAULT_HASH_TRUNCATION=32
 RS_DELTA_MAGIC=0x72730236
-RS_SIG_MAGIC=0x72730136
+RS_MD4_SIG_MAGIC=0x72730136
+RS_BLAKE2_SIG_MAGIC=0x72730137
 
 def log2(i):
 	return int(math.log(i, 2))
@@ -63,19 +65,23 @@ def md4(data):
 	ctx.update(data)
 	return ctx.digest()
 
+def blake2(data):
+	ctx = pyblake2.blake2b()
+	ctx.update(data)
+	return ctx.digest()
 
 #################
 #### Packets ####
 #################
 
 class Signature(object):
-	def __init__(self, rollsum, md4sum, offset):
+	def __init__(self, rollsum, strongsum, offset):
 		self.rollsum = rollsum
-		self.md4sum = md4sum
+		self.strongsum = strongsum
 		self.offset = offset
 
 	def __str__(self):
-		return "SIGNATURE: {0:08x} {1!r} {2!r}".format(self.rollsum, binascii.hexlify(self.md4sum), self.offset)
+		return "SIGNATURE: {0:08x} {1!r} {2!r}".format(self.rollsum, binascii.hexlify(self.strongsum), self.offset)
 
 def byte_length(i):
 	bit_len = i.bit_length()
@@ -196,38 +202,40 @@ def read_int(fd, nbytes):
 	return _integer_decoders[nbytes](buf)[0]
 
 class Signatures(object):
-	def __init__(self, blocksize, md4_truncation):
+	def __init__(self, blocksize, hash_truncation, magic=RS_BLAKE2_SIG_MAGIC):
 		self.blocksize = blocksize
-		self.md4_truncation = md4_truncation
+		self.hash_truncation = hash_truncation
+		self.magic = magic
 
 	def __iter__(self):
 		return self.iterator
 
 	@classmethod
 	def from_signature_file(cls, fd):
-		if read_int(fd, 4) != RS_SIG_MAGIC:
+		magic = read_int(fd, 4)
+		if magic not in (RS_BLAKE2_SIG_MAGIC, RS_MD4_SIG_MAGIC):
 			raise IOError("Invalid signature file magic")
 		blocksize = read_int(fd, 4)
-		md4_truncation = read_int(fd, 4)
-		if md4_truncation > 16 or md4_truncation < 1:
-			raise ValueError("Strong sum length must be 1-16 bytes long")
-		self = cls(blocksize, md4_truncation)
+		hash_truncation = read_int(fd, 4)
+		if hash_truncation > 32 or hash_truncation < 1:
+			raise ValueError("Strong sum length must be 1-32 bytes long")
+		self = cls(blocksize, hash_truncation, magic)
 		self.iterator = self._generate_from_signature_file(fd)
 		return self
 
 	@classmethod
-	def from_basis_file(cls, fd, blocksize=DEFAULT_BLOCKSIZE, md4_truncation=DEFAULT_MD4_TRUNCATION):
-		self = cls(blocksize, md4_truncation)
+	def from_basis_file(cls, fd, blocksize=DEFAULT_BLOCKSIZE, hash_truncation=DEFAULT_HASH_TRUNCATION):
+		self = cls(blocksize, hash_truncation)
 		self.iterator = self._generate_from_basis(fd)
 		return self
 
 	def write(self, fd):
-		write_int(fd, RS_SIG_MAGIC, 4)
+		write_int(fd, self.magic, 4)
 		write_int(fd, self.blocksize, 4)
-		write_int(fd, self.md4_truncation, 4)
+		write_int(fd, self.hash_truncation, 4)
 		for signature in self.iterator:
 			write_int(fd, signature.rollsum, 4)
-			fd.write(signature.md4sum[:self.md4_truncation])
+			fd.write(signature.strongsum[:self.hash_truncation])
 
 
 	def _generate_from_signature_file(self, fd):
@@ -235,7 +243,7 @@ class Signatures(object):
 			offset = 0
 			while True:
 				rollsum = read_int(fd, 4)
-				strong_sum = read_bytes(fd, self.md4_truncation)
+				strong_sum = read_bytes(fd, self.hash_truncation)
 				yield Signature(rollsum, strong_sum, offset)
 				offset += self.blocksize
 		except EOFError:
@@ -245,13 +253,19 @@ class Signatures(object):
 		"""generate signatures for each block in fobj"""
 		offset = 0
 
+		if self.magic == RS_BLAKE2_SIG_MAGIC:
+			H = blake2
+		elif self.magic == RS_MD4_MAGIC:
+			H = md4
+		else:
+			raise RuntimeError("BUG: Invalid signature magic: " + str(signature.magic))
+
 		while True:
 			buf = fobj.read(self.blocksize) # Assuming blocking mode
 			if len(buf) == 0:
 				return
-			yield Signature(faster_rollsum(buf), md4(buf)[:self.md4_truncation], offset)
+			yield Signature(faster_rollsum(buf), H(buf)[:self.hash_truncation], offset)
 			offset += self.blocksize
-
 
 class Delta(object):
 	def __init__(self, iterator):
@@ -308,15 +322,21 @@ class Delta(object):
 		   generate a set of deltas (LiteralChange / CopyChange)"""
 		buf = changedfd.read() # Just read the whole damn file into memory
 		blocksize = signatures.blocksize
-		md4_truncation = signatures.md4_truncation
+		hash_truncation = signatures.hash_truncation
+		if signatures.magic == RS_BLAKE2_SIG_MAGIC:
+			H = blake2
+		elif signatures.magic == RS_MD4_SIG_MAGIC:
+			H = md4
+		else:
+			raise RuntimeError("BUG: Invalid signature magic: " + str(signature.magic))
 
 		sigs = {}
 		for s in iter(signatures):
 			if s.rollsum in sigs:
-				if s.md4sum not in sigs[s.rollsum]: # for identical/collision blocks, use only the first, as rdiff does
-					sigs[s.rollsum][s.md4sum] = s.offset
+				if s.strongsum not in sigs[s.rollsum]: # for identical/collision blocks, use only the first, as rdiff does
+					sigs[s.rollsum][s.strongsum] = s.offset
 			else:
-				sigs[s.rollsum] = { s.md4sum: s.offset }
+				sigs[s.rollsum] = { s.strongsum: s.offset }
 
 		rs = RollSum()
 
@@ -331,7 +351,7 @@ class Delta(object):
 			# Plow through the data, byte at a time
 			try:
 				md4_table = sigs[rs.sum()]
-				md = md4(buf[offset:offset+blocksize])[:md4_truncation]
+				md = H(buf[offset:offset+blocksize])[:hash_truncation]
 				file_offset = md4_table[md]
 				if offset > 0:
 					yield LiteralChange(buf[:offset])
@@ -348,7 +368,7 @@ class Delta(object):
 			# See if the last block is still at the end of file
 			try:
 				md4_table = sigs[rs.sum()]
-				md = md4(buf[offset:])[:md4_truncation]
+				md = H(buf[offset:])[:hash_truncation]
 				file_offset = md4_table[md]
 				if offset > 0:
 					yield LiteralChange(buf[:offset])
@@ -427,7 +447,7 @@ def main():
 			print(str(d))
 	elif sys.argv[1] == "debugsigs":
 		signatures = Signatures.from_signature_file(readfilearg(2))
-		print("SIG HEADER: blocksize={0:d} md4_truncation={1:d}".format(signatures.blocksize, signatures.md4_truncation))
+		print("SIG HEADER: magic={0:x} blocksize={1:d} hash_truncation={2:d}".format(signatures.magic, signatures.blocksize, signatures.hash_truncation))
 		for s in iter(signatures):
 			print(str(s))
 	else:
